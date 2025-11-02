@@ -1,0 +1,11 @@
+[toolchain]
+channel = "1.88.0"
+components = ["rustfmt", "clippy"]
+# Windows target
+targets = ["x86_64-pc-windows-msvc", 
+           # Linux targets
+           "x86_64-unknown-linux-gnu", 
+           "x86_64-unknown-linux-musl",
+           # ARM targets for Ubuntu on ARM
+           "aarch64-unknown-linux-gnu",
+           "aarch64-unknown-linux-musl"]
