@@ -56,7 +56,7 @@ sudo apt install -y \
 
 1. **Clone the repository:**
 ```bash
-git clone https://github.com/yourusername/discord-recorder.git
+git clone https://github.com/s-b-repo/octocord.git
 cd discord-recorder
 ```
 
