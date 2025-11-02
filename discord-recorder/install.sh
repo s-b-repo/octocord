@@ -1,5 +1,4 @@
 #!/bin/bash
-
 set -e
 
 echo "🎥 Discord Recorder Installation Script"
@@ -21,8 +20,21 @@ echo "📋 Installing system dependencies..."
 # Install dependencies based on OS
 if [[ "$OS" == "arch" ]]; then
     sudo pacman -S --needed base-devel pkg-config \
-        libx11 libwayland alsa-lib ffmpeg libv4l \
+        libx11 wayland-protocols alsa-lib ffmpeg libv4l clang \
         rust cargo
+
+    # ----------  ARCH-SPECIFIC FFMPEG FIX  ----------
+    # Arch headers live under /usr/include/ffmpeg, but ffmpeg-sys-next
+    # hard-codes /usr/include/libavcodec/...
+    # Create compatibility symlinks (idempotent)
+    [[ -d /usr/include/ffmpeg && ! -L /usr/include/libavcodec ]] && \
+        sudo ln -sT ffmpeg /usr/include/ffmpeg-sys
+    for d in libavcodec libavformat libavutil libavfilter libavdevice libswresample libswscale; do
+        [[ -d /usr/include/ffmpeg/$d && ! -e /usr/include/$d ]] && \
+            sudo ln -sT ffmpeg/$d /usr/include/$d
+    done
+    # ------------------------------------------------
+
 elif [[ "$OS" == "debian" ]]; then
     sudo apt update
     sudo apt install -y build-essential pkg-config \
@@ -30,7 +42,7 @@ elif [[ "$OS" == "debian" ]]; then
         libavcodec-dev libavformat-dev libavutil-dev \
         libswscale-dev libv4l-dev \
         curl
-    
+
     # Install Rust if not present
     if ! command -v cargo &> /dev/null; then
         echo "🦀 Installing Rust..."
@@ -56,7 +68,7 @@ cat > "$DESKTOP_ENTRY" << EOF
 Name=Discord Recorder
 Comment=High-performance screen recording with Discord UI
 Exec=$PWD/target/release/discord-recorder
-Icon=$PWD/assets/icon.png
+Icon=applications-multimedia
 Terminal=false
 Type=Application
 Categories=AudioVideo;Recorder;
