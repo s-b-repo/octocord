@@ -17,7 +17,7 @@ rodio = "0.19"
 hound = "3.5"
 
 # Video Encoding
-ffmpeg-next = { version = "7.1", features = ["codec", "format", "filter", "software-resampling", "software-scaling"] }
+ffmpeg-next = { version = "8.0.0", features = ["codec", "format", "filter", "software-resampling", "software-scaling"] }
 
 # Webcam Support
 nokhwa = { version = "0.10", features = ["input-native", "output-threaded"], optional = true }
