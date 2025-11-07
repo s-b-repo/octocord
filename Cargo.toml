@@ -27,6 +27,7 @@ image = "0.25.8"
 
 # Async Support
 tokio = { version = "1.48.0", features = ["full"] }
+once_cell = "1.19"
 
 # Error Handling
 anyhow = "1.0"
@@ -54,6 +55,9 @@ chrono = "0.4"
 crossbeam = "0.8"
 parking_lot = "0.12"
 
+
+#other
+num-traits = "0.2.19"
 
 [features]
 default = ["webcam", "screenshots"]
