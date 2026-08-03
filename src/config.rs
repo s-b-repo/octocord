@@ -16,10 +16,129 @@ pub struct Config {
     pub discord_theme: DiscordTheme,
     #[serde(default)]
     pub separate_outputs: bool,
-    #[serde(default)]
+    /// Kept for compatibility with older configuration files. Wayland capture now
+    /// always goes through the portal when one is present, because x11grab cannot
+    /// see a Wayland desktop at all.
+    #[serde(default = "default_true")]
     pub use_pipewire_on_wayland: bool,
     #[serde(default)]
     pub enable_preview_overlay: bool,
+    /// Output geometry. Independent of the quality tier so any monitor size,
+    /// preset or hand-typed resolution can be recorded.
+    #[serde(default)]
+    pub output_resolution: OutputResolution,
+    #[serde(default)]
+    pub encoder: EncoderPreference,
+    #[serde(default)]
+    pub audio_source: AudioSource,
+    #[serde(default = "default_true")]
+    pub capture_cursor: bool,
+    /// Portal token that lets a later session skip the screen picker dialog.
+    #[serde(default)]
+    pub screencast_restore_token: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Resolution of the encoded file. `Native` keeps whatever the capture produced.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum OutputResolution {
+    #[default]
+    Native,
+    P720,
+    P1080,
+    P1440,
+    P2160,
+    Custom {
+        width: u32,
+        height: u32,
+    },
+}
+
+impl OutputResolution {
+    pub const PRESETS: [OutputResolution; 5] = [
+        OutputResolution::Native,
+        OutputResolution::P720,
+        OutputResolution::P1080,
+        OutputResolution::P1440,
+        OutputResolution::P2160,
+    ];
+
+    /// Target box in pixels, or `None` to keep the source size.
+    pub fn target(self) -> Option<(u32, u32)> {
+        match self {
+            OutputResolution::Native => None,
+            OutputResolution::P720 => Some((1280, 720)),
+            OutputResolution::P1080 => Some((1920, 1080)),
+            OutputResolution::P1440 => Some((2560, 1440)),
+            OutputResolution::P2160 => Some((3840, 2160)),
+            OutputResolution::Custom { width, height } => Some((width.max(2), height.max(2))),
+        }
+    }
+
+    pub fn label(self) -> String {
+        match self {
+            OutputResolution::Native => "Native (source resolution)".to_string(),
+            OutputResolution::P720 => "1280 x 720".to_string(),
+            OutputResolution::P1080 => "1920 x 1080".to_string(),
+            OutputResolution::P1440 => "2560 x 1440".to_string(),
+            OutputResolution::P2160 => "3840 x 2160".to_string(),
+            OutputResolution::Custom { width, height } => format!("Custom ({} x {})", width, height),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum EncoderPreference {
+    /// Hardware when the probe succeeds, software otherwise.
+    #[default]
+    Auto,
+    Hardware,
+    Software,
+}
+
+impl EncoderPreference {
+    pub const ALL: [EncoderPreference; 3] = [
+        EncoderPreference::Auto,
+        EncoderPreference::Hardware,
+        EncoderPreference::Software,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            EncoderPreference::Auto => "Auto (hardware when available)",
+            EncoderPreference::Hardware => "Hardware (VAAPI)",
+            EncoderPreference::Software => "Software (libx264)",
+        }
+    }
+}
+
+/// Which audio the recorder captures. "System" is the monitor of the default output,
+/// which is what desktop audio actually lives on — the default *source* is the mic.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum AudioSource {
+    #[default]
+    System,
+    Microphone,
+    Both,
+}
+
+impl AudioSource {
+    pub const ALL: [AudioSource; 3] = [
+        AudioSource::System,
+        AudioSource::Microphone,
+        AudioSource::Both,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AudioSource::System => "System audio (speaker monitor)",
+            AudioSource::Microphone => "Microphone",
+            AudioSource::Both => "System audio + microphone",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -30,6 +149,15 @@ pub enum VideoQuality {
     Ultra,
 }
 
+impl VideoQuality {
+    pub const ALL: [VideoQuality; 4] = [
+        VideoQuality::Low,
+        VideoQuality::Medium,
+        VideoQuality::High,
+        VideoQuality::Ultra,
+    ];
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AudioQuality {
     Low,
@@ -38,11 +166,32 @@ pub enum AudioQuality {
     Lossless,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+impl AudioQuality {
+    pub const ALL: [AudioQuality; 4] = [
+        AudioQuality::Low,
+        AudioQuality::Medium,
+        AudioQuality::High,
+        AudioQuality::Lossless,
+    ];
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DiscordTheme {
     Dark,
     Light,
     AMOLED,
+}
+
+impl DiscordTheme {
+    pub const ALL: [DiscordTheme; 3] = [DiscordTheme::Dark, DiscordTheme::Light, DiscordTheme::AMOLED];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            DiscordTheme::Dark => "Dark",
+            DiscordTheme::Light => "Light",
+            DiscordTheme::AMOLED => "AMOLED",
+        }
+    }
 }
 
 impl Default for Config {
@@ -64,8 +213,13 @@ impl Default for Config {
             record_webcam: false,
             discord_theme: DiscordTheme::Dark,
             separate_outputs: false,
-            use_pipewire_on_wayland: false,
+            use_pipewire_on_wayland: true,
             enable_preview_overlay: false,
+            output_resolution: OutputResolution::Native,
+            encoder: EncoderPreference::Auto,
+            audio_source: AudioSource::System,
+            capture_cursor: true,
+            screencast_restore_token: None,
         }
     }
 }
@@ -130,6 +284,14 @@ impl Config {
             AudioQuality::Medium => 44100,
             AudioQuality::High => 48000,
             AudioQuality::Lossless => 96000,
+        }
+    }
+
+    /// Capture frame rate implied by the selected video quality.
+    pub fn get_frame_rate(&self) -> u32 {
+        match self.video_quality {
+            VideoQuality::Low | VideoQuality::Medium => 30,
+            VideoQuality::High | VideoQuality::Ultra => 60,
         }
     }
 

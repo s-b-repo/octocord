@@ -1,17 +1,22 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use egui::{
     CentralPanel, TopBottomPanel, RichText, Color32, ColorImage, TextureHandle, TextureOptions,
     Stroke, ProgressBar, DragValue, Slider, KeyboardShortcut, Modifiers, Key
 };
 use egui::vec2;
 use image::DynamicImage;
-use log::{info, error};
+use log::{error, info, warn};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::{
     audio::{self, AudioProcessor, AudioRecorder},
-    config::{Config, VideoQuality, AudioQuality},
+    config::{
+        AudioQuality, AudioSource, Config, DiscordTheme, EncoderPreference, OutputResolution,
+        VideoQuality,
+    },
+    pipewire_capture::{Frame, PixelFormat, ScreenSource},
+    portal,
     screen::{self, ScreenCapture},
     video::{RecorderOptions, VideoEncoder},
     webcam::{self, WebcamCapture},
@@ -73,6 +78,12 @@ pub struct AppState {
     pub enable_preview_overlay: bool,
     pub screen_zoom: f32,
     pub webcam_zoom: f32,
+    pub output_resolution: OutputResolution,
+    pub custom_resolution: (u32, u32),
+    pub encoder: EncoderPreference,
+    pub audio_source: AudioSource,
+    pub capture_cursor: bool,
+    pub theme: DiscordTheme,
 }
 
 impl AppState {
@@ -98,13 +109,56 @@ impl AppState {
             overlay_size: (320, 180),
             overlay_opacity: 0.9,
             hotkeys: HotkeyConfig::default(),
-            use_pipewire_on_wayland: false,
+            use_pipewire_on_wayland: config.use_pipewire_on_wayland,
             enable_preview_overlay,
             screen_zoom: 1.0,
             webcam_zoom: 1.0,
+            output_resolution: config.output_resolution,
+            custom_resolution: match config.output_resolution {
+                OutputResolution::Custom { width, height } => (width, height),
+                _ => (1920, 1080),
+            },
+            encoder: config.encoder,
+            audio_source: config.audio_source,
+            capture_cursor: config.capture_cursor,
+            theme: config.discord_theme,
             config,
         }
     }
+
+    /// Fold the live UI state into a `Config`.
+    ///
+    /// This is the single place where "what the user sees" becomes "what gets saved
+    /// and recorded", so the settings can no longer drift apart from the encoder.
+    pub fn snapshot_config(&self) -> Config {
+        let mut config = self.config.clone();
+        config.set_output_directory(self.output_path.clone());
+        config.record_audio = self.record_audio;
+        config.record_video = self.record_video;
+        config.record_webcam = self.record_webcam;
+        config.separate_outputs = self.separate_outputs;
+        config.use_pipewire_on_wayland = self.use_pipewire_on_wayland;
+        config.enable_preview_overlay = self.enable_preview_overlay;
+        config.video_quality = self.video_quality;
+        config.audio_quality = self.audio_quality;
+        config.default_screen = self.selected_screen;
+        config.default_audio_device = self.selected_audio_device.clone();
+        config.default_webcam = self.selected_webcam.clone();
+        config.output_resolution = self.output_resolution;
+        config.encoder = self.encoder;
+        config.audio_source = self.audio_source;
+        config.capture_cursor = self.capture_cursor;
+        config.discord_theme = self.theme;
+        config
+    }
+}
+
+/// What the settings window asked the app to do this frame.
+#[derive(Default)]
+struct SettingsOutcome {
+    refresh_devices: bool,
+    forget_permission: bool,
+    save: bool,
 }
 
 #[derive(Default)]
@@ -112,6 +166,24 @@ struct HotkeyTriggers {
     toggle_record: bool,
     toggle_pause: bool,
     toggle_webcam: bool,
+}
+
+fn video_quality_label(quality: VideoQuality) -> &'static str {
+    match quality {
+        VideoQuality::Low => "Low — 1 Mbps, 30 fps",
+        VideoQuality::Medium => "Medium — 2.5 Mbps, 30 fps",
+        VideoQuality::High => "High — 5 Mbps, 60 fps",
+        VideoQuality::Ultra => "Ultra — 10 Mbps, 60 fps",
+    }
+}
+
+fn audio_quality_label(quality: AudioQuality) -> &'static str {
+    match quality {
+        AudioQuality::Low => "Low — 22.05 kHz, 64 kbps",
+        AudioQuality::Medium => "Medium — 44.1 kHz, 128 kbps",
+        AudioQuality::High => "High — 48 kHz, 256 kbps",
+        AudioQuality::Lossless => "Lossless — 96 kHz, 320 kbps",
+    }
 }
 
 fn format_shortcut(shortcut: &KeyboardShortcut) -> String {
@@ -150,6 +222,12 @@ pub struct DiscordRecorderApp {
     available_webcams: Vec<String>,
     screen_preview_texture: Option<TextureHandle>,
     webcam_preview_texture: Option<TextureHandle>,
+    screen_preview_error: Option<String>,
+    webcam_preview_error: Option<String>,
+    last_error: Option<String>,
+    /// Compositor capture, shared by the preview and the encoder so only one
+    /// portal session (and one picker dialog) is ever needed.
+    screen_source: Option<ScreenSource>,
     audio_level: f32,
     awaiting_hotkey: Option<HotkeyAction>,
     active_screen_index: Option<usize>,
@@ -183,6 +261,10 @@ impl DiscordRecorderApp {
             available_webcams: Vec::new(),
             screen_preview_texture: None,
             webcam_preview_texture: None,
+            screen_preview_error: None,
+            webcam_preview_error: None,
+            last_error: None,
+            screen_source: None,
             audio_level: 0.0,
             awaiting_hotkey: None,
             active_screen_index: None,
@@ -212,41 +294,111 @@ impl DiscordRecorderApp {
     }
 
     fn initialize_previews(&mut self) {
-        let (record_video, record_webcam, screen_index, webcam_name) = {
-            let state = self.state.lock().unwrap();
-            (
-                state.record_video,
-                state.record_webcam,
-                state.selected_screen.unwrap_or(0),
-                state.selected_webcam.clone().unwrap_or_else(|| "Default Webcam".to_string()),
-            )
-        };
+        self.ensure_capture_state();
+    }
 
-        if record_video && self.screen_capture.is_none() {
-            if let Ok(mut capture) = ScreenCapture::new(screen_index) {
-                if let Err(e) = capture.start() {
-                    error!("Failed to start screen preview: {}", e);
-                } else {
-                    self.screen_capture = Some(capture);
-                    self.active_screen_index = Some(screen_index);
-                }
-            }
+    /// (Re)start the screen preview for `screen_index`.
+    ///
+    /// The index is recorded even when the start fails, so a display that cannot be
+    /// previewed (Wayland, missing permissions, ...) is reported once instead of being
+    /// retried — and re-logged — on every frame.
+    fn restart_screen_preview(&mut self, screen_index: usize) {
+        if let Some(capture) = self.screen_capture.as_mut() {
+            let _ = capture.stop();
         }
+        self.screen_capture = None;
+        self.screen_preview_texture = None;
+        self.active_screen_index = Some(screen_index);
 
-        if record_webcam && self.webcam_capture.is_none() {
-            if let Ok(mut capture) = WebcamCapture::new(&webcam_name) {
-                if let Err(e) = capture.start() {
-                    error!("Failed to start webcam preview: {}", e);
-                } else {
-                    self.webcam_capture = Some(capture);
-                    self.active_webcam_name = Some(webcam_name);
-                }
+        match ScreenCapture::new(screen_index).and_then(|mut c| c.start().map(|()| c)) {
+            Ok(capture) => {
+                self.screen_capture = Some(capture);
+                self.screen_preview_error = None;
+            }
+            Err(e) => {
+                warn!("Screen preview unavailable: {}", e);
+                self.screen_preview_error = Some(e.to_string());
             }
         }
     }
 
+    fn restart_webcam_preview(&mut self, webcam_name: &str) {
+        if let Some(capture) = self.webcam_capture.as_mut() {
+            let _ = capture.stop();
+        }
+        self.webcam_capture = None;
+        self.webcam_preview_texture = None;
+        self.active_webcam_name = Some(webcam_name.to_string());
+
+        match WebcamCapture::new(webcam_name).and_then(|mut c| c.start().map(|()| c)) {
+            Ok(capture) => {
+                self.webcam_capture = Some(capture);
+                self.webcam_preview_error = None;
+            }
+            Err(e) => {
+                warn!("Webcam preview unavailable: {}", e);
+                self.webcam_preview_error = Some(e.to_string());
+            }
+        }
+    }
+
+    /// Whether the desktop has to be captured through the compositor.
+    ///
+    /// X11 keeps using x11grab: it needs no permission dialog and no extra copy. A
+    /// Wayland compositor never exposes the desktop to X11, so there the portal is
+    /// the only option — deliberately not gated on a stored preference, because a
+    /// config saying otherwise would silently produce black recordings.
+    fn use_compositor_capture(&self) -> bool {
+        screen::is_wayland_session() && portal::is_available()
+    }
+
+    /// Open (or reuse) the compositor capture session.
+    ///
+    /// The first call shows the compositor's screen picker. The token it returns is
+    /// persisted so later sessions start without asking again.
+    fn ensure_screen_source(&mut self) -> Result<()> {
+        if self.screen_source.is_some() {
+            return Ok(());
+        }
+
+        let (restore_token, capture_cursor) = {
+            let state = self.state.lock().unwrap();
+            (
+                state.config.screencast_restore_token.clone(),
+                state.capture_cursor,
+            )
+        };
+
+        let source = ScreenSource::start(restore_token, capture_cursor)?;
+        info!(
+            "Compositor capture ready: {}x{}",
+            source.format.width, source.format.height
+        );
+
+        if let Some(token) = source.restore_token().map(str::to_owned) {
+            let mut state = self.state.lock().unwrap();
+            if state.config.screencast_restore_token.as_deref() != Some(token.as_str()) {
+                state.config.screencast_restore_token = Some(token);
+                if let Err(e) = state.config.save() {
+                    warn!("Could not persist the screen capture permission: {}", e);
+                }
+            }
+        }
+
+        self.screen_preview_error = None;
+        self.screen_source = Some(source);
+        Ok(())
+    }
+
+    fn close_screen_source(&mut self) {
+        if let Some(source) = self.screen_source.take() {
+            source.capture.stop();
+        }
+        self.screen_preview_texture = None;
+    }
+
     fn ensure_capture_state(&mut self) {
-        let (record_video, screen_index, record_webcam, webcam_name) = {
+        let (record_video, screen_index, record_webcam, webcam_name, is_recording) = {
             let state = self.state.lock().unwrap();
             (
                 state.record_video,
@@ -256,26 +408,15 @@ impl DiscordRecorderApp {
                     .selected_webcam
                     .clone()
                     .unwrap_or_else(|| "Default Webcam".to_string()),
+                state.is_recording,
             )
         };
 
-        if record_video {
+        // On Wayland the preview comes from the compositor stream, which is only
+        // opened on demand (it needs the user's consent), so there is nothing to poll.
+        if record_video && !self.use_compositor_capture() {
             if self.active_screen_index != Some(screen_index) {
-                if let Some(capture) = self.screen_capture.as_mut() {
-                    let _ = capture.stop();
-                }
-                self.screen_capture = None;
-                match ScreenCapture::new(screen_index) {
-                    Ok(mut capture) => {
-                        if let Err(e) = capture.start() {
-                            error!("Failed to start screen capture: {}", e);
-                        } else {
-                            self.screen_capture = Some(capture);
-                            self.active_screen_index = Some(screen_index);
-                        }
-                    }
-                    Err(e) => error!("Failed to create screen capture: {}", e),
-                }
+                self.restart_screen_preview(screen_index);
             }
         } else if self.screen_capture.is_some() {
             if let Some(capture) = self.screen_capture.as_mut() {
@@ -285,23 +426,10 @@ impl DiscordRecorderApp {
             self.active_screen_index = None;
         }
 
-        if record_webcam {
+        // While recording, ffmpeg owns the v4l2 node — a second reader would get EBUSY.
+        if record_webcam && !is_recording {
             if self.active_webcam_name.as_deref() != Some(webcam_name.as_str()) {
-                if let Some(capture) = self.webcam_capture.as_mut() {
-                    let _ = capture.stop();
-                }
-                self.webcam_capture = None;
-                match WebcamCapture::new(&webcam_name) {
-                    Ok(mut capture) => {
-                        if let Err(e) = capture.start() {
-                            error!("Failed to start webcam capture: {}", e);
-                        } else {
-                            self.webcam_capture = Some(capture);
-                            self.active_webcam_name = Some(webcam_name);
-                        }
-                    }
-                    Err(e) => error!("Failed to create webcam capture: {}", e),
-                }
+                self.restart_webcam_preview(&webcam_name);
             }
         } else if self.webcam_capture.is_some() {
             if let Some(capture) = self.webcam_capture.as_mut() {
@@ -353,12 +481,19 @@ impl DiscordRecorderApp {
 
     fn toggle_recording(&mut self) {
         let is_recording = { self.state.lock().unwrap().is_recording };
-        if is_recording {
-            if let Err(e) = self.stop_recording() {
-                error!("Failed to stop recording: {}", e);
+        let result = if is_recording {
+            self.stop_recording()
+        } else {
+            self.start_recording()
+        };
+
+        match result {
+            Ok(()) => self.last_error = None,
+            Err(e) => {
+                let action = if is_recording { "stop" } else { "start" };
+                error!("Failed to {} recording: {:#}", action, e);
+                self.last_error = Some(format!("Failed to {} recording: {:#}", action, e));
             }
-        } else if let Err(e) = self.start_recording() {
-            error!("Failed to start recording: {}", e);
         }
     }
 
@@ -418,18 +553,114 @@ impl DiscordRecorderApp {
         }
     }
 
-    fn draw_settings_contents(&mut self, ui: &mut egui::Ui) -> bool {
+    fn draw_settings_contents(&mut self, ui: &mut egui::Ui) -> SettingsOutcome {
         let mut state = self.state.lock().unwrap();
         let mut refresh_requested = false;
+        let mut forget_permission = false;
+        let mut save_requested = false;
 
         ui.heading("Capture Options");
         ui.checkbox(&mut state.record_audio, "Record system audio");
         ui.checkbox(&mut state.record_video, "Record screen");
         ui.checkbox(&mut state.record_webcam, "Enable webcam overlay");
         ui.checkbox(&mut state.separate_outputs, "Save audio and video separately");
+        ui.checkbox(&mut state.enable_preview_overlay, "Composite webcam onto the screen preview");
+
+        ui.separator();
+        ui.heading("Output");
+        ui.horizontal(|ui| {
+            ui.label("Folder");
+            ui.add(egui::TextEdit::singleline(&mut state.output_path).desired_width(320.0));
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Resolution");
+            egui::ComboBox::from_id_salt("settings_resolution")
+                .selected_text(state.output_resolution.label())
+                .show_ui(ui, |ui| {
+                    for preset in OutputResolution::PRESETS {
+                        ui.selectable_value(&mut state.output_resolution, preset, preset.label());
+                    }
+                    let custom = OutputResolution::Custom {
+                        width: state.custom_resolution.0,
+                        height: state.custom_resolution.1,
+                    };
+                    ui.selectable_value(&mut state.output_resolution, custom, "Custom...");
+                });
+        });
+
+        if matches!(state.output_resolution, OutputResolution::Custom { .. }) {
+            ui.horizontal(|ui| {
+                ui.label("Custom size");
+                let mut width = state.custom_resolution.0 as i32;
+                let mut height = state.custom_resolution.1 as i32;
+                let changed = ui.add(DragValue::new(&mut width).range(16..=16384)).changed()
+                    | ui.label("x").clicked()
+                    | ui.add(DragValue::new(&mut height).range(16..=16384)).changed();
+                if changed {
+                    state.custom_resolution = (width.max(16) as u32, height.max(16) as u32);
+                    state.output_resolution = OutputResolution::Custom {
+                        width: state.custom_resolution.0,
+                        height: state.custom_resolution.1,
+                    };
+                }
+            });
+            ui.label(
+                RichText::new("The source is never upscaled and the result is always even-sized.")
+                    .small(),
+            );
+        }
+
+        ui.horizontal(|ui| {
+            ui.label("Video quality");
+            egui::ComboBox::from_id_salt("settings_video_quality")
+                .selected_text(video_quality_label(state.video_quality))
+                .show_ui(ui, |ui| {
+                    for quality in VideoQuality::ALL {
+                        ui.selectable_value(&mut state.video_quality, quality, video_quality_label(quality));
+                    }
+                });
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Audio quality");
+            egui::ComboBox::from_id_salt("settings_audio_quality")
+                .selected_text(audio_quality_label(state.audio_quality))
+                .show_ui(ui, |ui| {
+                    for quality in AudioQuality::ALL {
+                        ui.selectable_value(&mut state.audio_quality, quality, audio_quality_label(quality));
+                    }
+                });
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Encoder");
+            egui::ComboBox::from_id_salt("settings_encoder")
+                .selected_text(state.encoder.label())
+                .show_ui(ui, |ui| {
+                    for preference in EncoderPreference::ALL {
+                        ui.selectable_value(&mut state.encoder, preference, preference.label());
+                    }
+                });
+            if crate::video::hardware_encoding_available("ffmpeg") {
+                ui.label(RichText::new("GPU encoding available").small());
+            } else {
+                ui.label(RichText::new("GPU encoding unavailable").small());
+            }
+        });
 
         ui.separator();
         ui.heading("Audio");
+        ui.horizontal(|ui| {
+            ui.label("Source");
+            egui::ComboBox::from_id_salt("settings_audio_source")
+                .selected_text(state.audio_source.label())
+                .show_ui(ui, |ui| {
+                    for source in AudioSource::ALL {
+                        ui.selectable_value(&mut state.audio_source, source, source.label());
+                    }
+                });
+        });
         ui.label("Input Gain (dB)");
         ui.add(Slider::new(&mut state.audio_gain_db, -30.0..=12.0).suffix(" dB"));
 
@@ -517,19 +748,61 @@ impl DiscordRecorderApp {
         });
 
         ui.separator();
-        ui.heading("Hotkeys");
+        ui.heading("Appearance");
+        ui.horizontal(|ui| {
+            ui.label("Theme");
+            egui::ComboBox::from_id_salt("settings_theme")
+                .selected_text(state.theme.label())
+                .show_ui(ui, |ui| {
+                    for theme in DiscordTheme::ALL {
+                        ui.selectable_value(&mut state.theme, theme, theme.label());
+                    }
+                });
+        });
+
+        if crate::screen::is_wayland_session() {
+            ui.separator();
+            ui.heading("Wayland capture");
+            if portal::is_available() {
+                ui.label(
+                    RichText::new(
+                        "The desktop is captured through the screencast portal — the only \
+                         interface a Wayland compositor offers.",
+                    )
+                    .small(),
+                );
+            } else {
+                ui.colored_label(
+                    Color32::from_rgb(240, 71, 71),
+                    "No screencast portal found. Recording falls back to X11 capture, which \
+                     only sees X11 windows on this session.",
+                );
+            }
+            ui.checkbox(&mut state.capture_cursor, "Include the mouse cursor");
+
+            let has_permission = state.config.screencast_restore_token.is_some();
+            ui.add_enabled_ui(has_permission, |ui| {
+                if ui
+                    .button("Forget screen permission")
+                    .on_hover_text(
+                        "Ask the compositor which screen to share again on the next recording.",
+                    )
+                    .clicked()
+                {
+                    state.config.screencast_restore_token = None;
+                    forget_permission = true;
+                }
+            });
+            if !has_permission {
+                ui.label(
+                    RichText::new("The screen picker will appear when recording starts.").small(),
+                );
+            }
+        }
 
         ui.separator();
-        ui.heading("Wayland");
-        let ffmpeg_has_pipewire = crate::video::ffmpeg_supports_pipewire("ffmpeg");
-        ui.add_enabled(
-            ffmpeg_has_pipewire,
-            egui::Checkbox::without_text(&mut state.use_pipewire_on_wayland)
-        ).on_hover_text(
-            if ffmpeg_has_pipewire { "Use Wayland PipeWire capture (experimental)" } else { "ffmpeg pipewire input not available" }
-        );
-        state.config.enable_preview_overlay = state.enable_preview_overlay;
- 
+        ui.heading("Hotkeys");
+
         let default_hotkeys = HotkeyConfig::default();
 
         ui.horizontal(|ui| {
@@ -578,79 +851,52 @@ impl DiscordRecorderApp {
         });
  
         ui.separator();
-        if ui.button("Refresh device list").clicked() {
-            refresh_requested = true;
-        }
+        ui.horizontal(|ui| {
+            if ui.button("Refresh device list").clicked() {
+                refresh_requested = true;
+            }
+            if ui
+                .button("Save settings")
+                .on_hover_text("Settings are also saved automatically when a recording starts.")
+                .clicked()
+            {
+                save_requested = true;
+            }
+        });
 
-        refresh_requested
+        SettingsOutcome {
+            refresh_devices: refresh_requested,
+            forget_permission,
+            save: save_requested,
+        }
     }
 
     fn start_recording(&mut self) -> Result<()> {
-        let (
-            output_path,
-            include_audio,
-            include_video,
-            include_webcam,
-            separate_outputs,
-            selected_screen,
-            audio_device_opt,
-            webcam_device_opt,
-            audio_gain_db,
-            use_pipewire_on_wayland,
-            enable_preview_overlay,
-            video_quality,
-            audio_quality,
-            mut config_snapshot,
-        ) = {
+        let config_snapshot = {
             let state = self.state.lock().unwrap();
             if state.is_recording {
                 return Ok(());
             }
-
-            (
-                state.output_path.clone(),
-                state.record_audio,
-                state.record_video,
-                state.record_webcam,
-                state.separate_outputs,
-                state.selected_screen,
-                state.selected_audio_device.clone(),
-                state.selected_webcam.clone(),
-                state.audio_gain_db,
-                state.use_pipewire_on_wayland,
-                state.enable_preview_overlay,
-                state.video_quality,
-                state.audio_quality,
-                state.config.clone(),
-            )
+            state.snapshot_config()
         };
+
+        let include_audio = config_snapshot.record_audio;
+        let include_video = config_snapshot.record_video;
+        let include_webcam = config_snapshot.record_webcam;
+        let separate_outputs = config_snapshot.separate_outputs;
+        let selected_screen = config_snapshot.default_screen;
+        let audio_device_opt = config_snapshot.default_audio_device.clone();
+        let webcam_device_opt = config_snapshot.default_webcam.clone();
+        let audio_gain_db = { self.state.lock().unwrap().audio_gain_db };
 
         info!("Starting recording");
 
-        // Ensure output directory exists
-        std::fs::create_dir_all(&output_path)?;
+        // Fail before the compositor asks the user to pick a screen.
+        crate::video::ensure_ffmpeg_available("ffmpeg")
+            .context("ffmpeg is required to record. Install it and make sure it is on PATH")?;
 
-        config_snapshot.set_output_directory(output_path.clone());
-        config_snapshot.record_audio = include_audio;
-        config_snapshot.record_video = include_video;
-        config_snapshot.record_webcam = include_webcam;
-        config_snapshot.separate_outputs = separate_outputs;
-        config_snapshot.use_pipewire_on_wayland = use_pipewire_on_wayland;
-        config_snapshot.enable_preview_overlay = enable_preview_overlay;
-        config_snapshot.video_quality = video_quality;
-        config_snapshot.audio_quality = audio_quality;
-        config_snapshot.default_screen = selected_screen;
-        config_snapshot.default_audio_device = audio_device_opt.clone();
-        config_snapshot.default_webcam = webcam_device_opt.clone();
-
+        std::fs::create_dir_all(config_snapshot.get_output_directory())?;
         config_snapshot.save()?;
-
-        // Reflect Wayland PipeWire preference via environment for the encoder
-        if use_pipewire_on_wayland {
-            std::env::set_var("OCTOCORD_USE_PIPEWIRE", "1");
-        } else {
-            std::env::remove_var("OCTOCORD_USE_PIPEWIRE");
-        }
 
         let options = RecorderOptions {
             output_directory: PathBuf::from(config_snapshot.get_output_directory()),
@@ -658,32 +904,29 @@ impl DiscordRecorderApp {
             video_bitrate_kbps: config_snapshot.get_video_bitrate(),
             audio_bitrate_kbps: config_snapshot.get_audio_bitrate(),
             audio_sample_rate: config_snapshot.get_audio_sample_rate(),
-            frame_rate: 60,
+            frame_rate: config_snapshot.get_frame_rate(),
             include_audio,
             include_video,
             include_webcam,
             separate_outputs,
             selected_screen,
+            audio_source: config_snapshot.audio_source,
             audio_device: audio_device_opt.clone(),
             webcam_device: webcam_device_opt.clone(),
             ffmpeg_path: "ffmpeg".to_string(),
             audio_gain_db,
+            output_resolution: config_snapshot.output_resolution,
+            encoder: config_snapshot.encoder,
         };
 
-        if include_video {
+        let compositor_capture = include_video && self.use_compositor_capture();
+        if compositor_capture {
+            // Opens the picker on first use; later runs reuse the stored token.
+            self.ensure_screen_source()
+                .context("Could not start the compositor screen capture")?;
+        } else if include_video && self.screen_capture.is_none() {
             let screen_index = selected_screen.unwrap_or(0);
-            if self.screen_capture.is_none() {
-                match ScreenCapture::new(screen_index) {
-                    Ok(mut capture) => {
-                        if let Err(e) = capture.start() {
-                            error!("Failed to start screen capture (screen_index={}): {}", screen_index, e);
-                        } else {
-                            self.screen_capture = Some(capture);
-                        }
-                    }
-                    Err(e) => error!("Failed to create screen capture (screen_index={}): {}", screen_index, e),
-                }
-            }
+            self.restart_screen_preview(screen_index);
         }
 
         // To avoid v4l2 device busy when ffmpeg opens the webcam, stop preview capture first.
@@ -692,16 +935,20 @@ impl DiscordRecorderApp {
                 let _ = capture.stop();
             }
             self.webcam_capture = None;
+            self.active_webcam_name = None;
         }
 
-        self.video_encoder = Some(VideoEncoder::new(options)?);
-        if let Some(encoder) = self.video_encoder.as_mut() {
-            if let Err(e) = encoder.start() {
-                error!("Failed to start encoder: {}", e);
-                self.video_encoder = None;
-                return Err(e);
+        let mut encoder = VideoEncoder::new(options)?;
+        if compositor_capture {
+            if let Some(source) = &self.screen_source {
+                encoder.set_screen_source(Arc::clone(&source.capture));
             }
         }
+        if let Err(e) = encoder.start() {
+            error!("Failed to start encoder: {:#}", e);
+            return Err(e);
+        }
+        self.video_encoder = Some(encoder);
 
         if include_audio {
             let device_name = audio_device_opt
@@ -734,19 +981,28 @@ impl DiscordRecorderApp {
     }
 
     fn stop_recording(&mut self) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
+        // Scoped so the lock is released before anything below touches the state
+        // again — std mutexes are not reentrant and re-locking here deadlocked the UI.
+        {
+            let mut state = self.state.lock().unwrap();
 
-        if !state.is_recording {
-            return Ok(());
+            if !state.is_recording {
+                return Ok(());
+            }
+
+            info!("Stopping recording");
+            state.is_recording = false;
+            state.is_paused = false;
         }
 
-        info!("Stopping recording");
-        state.is_recording = false;
-        state.is_paused = false;
-
+        let mut result = Ok(());
         if let Some(encoder) = &mut self.video_encoder {
-            encoder.stop()?;
+            if let Err(e) = encoder.stop() {
+                error!("Failed to stop encoder cleanly: {}", e);
+                result = Err(e);
+            }
         }
+        self.video_encoder = None;
 
         if let Some(recorder) = &mut self.audio_recorder {
             let _ = recorder.stop();
@@ -762,29 +1018,19 @@ impl DiscordRecorderApp {
             let _ = capture.stop();
         }
         self.webcam_capture = None;
-        self.video_encoder = None;
 
-        // Restore previews to prior state
-        {
-            let state = self.state.lock().unwrap();
-            if state.record_video && self.screen_capture.is_none() {
-                if let Some(idx) = state.selected_screen {
-                    if let Ok(mut cap) = ScreenCapture::new(idx) { let _ = cap.start(); self.screen_capture = Some(cap); }
-                }
-            }
-            if state.record_webcam && self.webcam_capture.is_none() {
-                let name = state.selected_webcam.clone().unwrap_or_else(|| "Default Webcam".to_string());
-                if let Ok(mut cap) = WebcamCapture::new(&name) { let _ = cap.start(); self.webcam_capture = Some(cap); }
-            }
-        }
+        // Forget which devices were live so `ensure_capture_state` rebuilds the previews.
+        self.active_screen_index = None;
+        self.active_webcam_name = None;
 
-        Ok(())
+        result
     }
 }
 
 impl eframe::App for DiscordRecorderApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.set_style(discord_style());
+        let theme = { self.state.lock().unwrap().theme };
+        ctx.set_style(discord_style(theme));
 
         let hotkey_triggers = self.handle_hotkeys(ctx);
         self.ensure_capture_state();
@@ -795,6 +1041,7 @@ impl eframe::App for DiscordRecorderApp {
         let mut toggle_record_click = false;
         let mut toggle_pause_click = false;
         let mut toggle_webcam_click = false;
+        let mut start_preview_click = false;
 
         TopBottomPanel::top("controls_panel").show(ctx, |ui| {
             let mut state = self.state.lock().unwrap();
@@ -871,6 +1118,26 @@ impl eframe::App for DiscordRecorderApp {
             });
         });
 
+        // The compositor stream, when present, is the authoritative preview source.
+        if let Some(source) = &self.screen_source {
+            if let Some(frame) = source.capture.latest_frame() {
+                let image = frame_to_color_image(&frame, 1600);
+                match &mut self.screen_preview_texture {
+                    Some(handle) => handle.set(image, TextureOptions::LINEAR),
+                    None => {
+                        self.screen_preview_texture = Some(ctx.load_texture(
+                            "screen_preview",
+                            image,
+                            TextureOptions::LINEAR,
+                        ))
+                    }
+                }
+            }
+            if let Some(err) = source.capture.error() {
+                self.screen_preview_error = Some(err);
+            }
+        }
+
         let screen_frame_opt = self
             .screen_capture
             .as_ref()
@@ -934,7 +1201,7 @@ impl eframe::App for DiscordRecorderApp {
             }
         }
 
-        let mut refresh_requested = false;
+        let mut settings_outcome = SettingsOutcome::default();
         let show_settings = { self.state.lock().unwrap().show_settings };
         if show_settings {
             let mut open_flag = show_settings;
@@ -954,7 +1221,7 @@ impl eframe::App for DiscordRecorderApp {
                         ui.separator();
                     }
 
-                    refresh_requested |= self.draw_settings_contents(ui);
+                    settings_outcome = self.draw_settings_contents(ui);
                 });
 
             {
@@ -963,7 +1230,7 @@ impl eframe::App for DiscordRecorderApp {
             }
         }
 
-        if refresh_requested {
+        if settings_outcome.refresh_devices {
             if let Err(e) = self.refresh_devices() {
                 error!("Failed to refresh devices: {}", e);
             } else {
@@ -971,7 +1238,36 @@ impl eframe::App for DiscordRecorderApp {
             }
         }
 
+        if settings_outcome.forget_permission {
+            // Drop the session too: it would otherwise keep sharing the old screen.
+            self.close_screen_source();
+        }
+
+        if settings_outcome.save || settings_outcome.forget_permission {
+            let config = { self.state.lock().unwrap().snapshot_config() };
+            match config.save() {
+                Ok(()) => {
+                    self.state.lock().unwrap().config = config;
+                    info!("Settings saved");
+                }
+                Err(e) => {
+                    error!("Failed to save settings: {:#}", e);
+                    self.last_error = Some(format!("Failed to save settings: {:#}", e));
+                }
+            }
+        }
+
         CentralPanel::default().show(ctx, |ui| {
+            if let Some(err) = self.last_error.clone() {
+                ui.horizontal(|ui| {
+                    ui.colored_label(Color32::from_rgb(240, 71, 71), err);
+                    if ui.small_button("Dismiss").clicked() {
+                        self.last_error = None;
+                    }
+                });
+                ui.separator();
+            }
+
             ui.heading("Preview");
             ui.separator();
 
@@ -994,6 +1290,23 @@ impl eframe::App for DiscordRecorderApp {
                     let rect = response.rect;
                     self.handle_overlay_interactions(ui, rect, scale, tex_w, tex_h);
                 }
+            } else if self.use_compositor_capture() {
+                ui.label("The screen preview starts once you share a screen.");
+                if ui
+                    .button("▶ Start screen preview")
+                    .on_hover_text(
+                        "Opens the compositor's screen picker. The same stream is reused for \
+                         recording, so you are only asked once.",
+                    )
+                    .clicked()
+                {
+                    start_preview_click = true;
+                }
+                if let Some(err) = &self.screen_preview_error {
+                    ui.colored_label(Color32::from_rgb(240, 71, 71), err);
+                }
+            } else if let Some(err) = &self.screen_preview_error {
+                ui.colored_label(Color32::from_rgb(255, 180, 0), format!("Screen preview: {}", err));
             } else {
                 ui.label("No screen preview available");
             }
@@ -1012,6 +1325,8 @@ impl eframe::App for DiscordRecorderApp {
                 let scale = (fit_scale * zoom).max(0.1);
                 let disp = vec2(tex_w * scale, tex_h * scale);
                 ui.image((texture.id(), disp));
+            } else if let Some(err) = &self.webcam_preview_error {
+                ui.colored_label(Color32::from_rgb(255, 180, 0), format!("Webcam preview: {}", err));
             } else {
                 ui.label("No webcam preview available");
             }
@@ -1045,36 +1360,151 @@ impl eframe::App for DiscordRecorderApp {
         if toggle_webcam_click || hotkey_triggers.toggle_webcam {
             self.toggle_webcam_capture();
         }
+        if start_preview_click {
+            if let Err(e) = self.ensure_screen_source() {
+                error!("Failed to start the screen preview: {:#}", e);
+                self.screen_preview_error = Some(format!("{:#}", e));
+            }
+        }
+
+        // egui only repaints on input, so live previews and the recording indicator
+        // need an explicit tick to stay animated.
+        let needs_animation = self.screen_capture.is_some()
+            || self.webcam_capture.is_some()
+            || self.audio_recorder.is_some();
+        if needs_animation {
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
+        }
     }
 }
 
-fn discord_style() -> egui::Style {
-    let mut style = egui::Style::default();
+/// Discord's own palette. Blurple stays the accent in every variant so the app keeps
+/// the same identity whichever background the user picks.
+struct Palette {
+    accent: Color32,
+    accent_hovered: Color32,
+    accent_active: Color32,
+    panel: Color32,
+    extreme: Color32,
+    code: Color32,
+    text: Color32,
+    muted_text: Color32,
+    border: Color32,
+    dark_mode: bool,
+}
 
-    // Discord color palette
-    style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(88, 101, 242);
-    style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(71, 82, 196);
-    style.visuals.widgets.active.bg_fill = Color32::from_rgb(58, 67, 159);
+fn palette(theme: DiscordTheme) -> Palette {
+    match theme {
+        DiscordTheme::Dark => Palette {
+            accent: Color32::from_rgb(88, 101, 242),
+            accent_hovered: Color32::from_rgb(71, 82, 196),
+            accent_active: Color32::from_rgb(58, 67, 159),
+            panel: Color32::from_rgb(54, 57, 63),
+            extreme: Color32::from_rgb(47, 49, 54),
+            code: Color32::from_rgb(40, 42, 46),
+            text: Color32::from_rgb(255, 255, 255),
+            muted_text: Color32::from_rgb(185, 187, 190),
+            border: Color32::from_rgb(32, 34, 37),
+            dark_mode: true,
+        },
+        DiscordTheme::Light => Palette {
+            accent: Color32::from_rgb(88, 101, 242),
+            accent_hovered: Color32::from_rgb(71, 82, 196),
+            accent_active: Color32::from_rgb(58, 67, 159),
+            panel: Color32::from_rgb(242, 243, 245),
+            extreme: Color32::from_rgb(255, 255, 255),
+            code: Color32::from_rgb(235, 237, 240),
+            text: Color32::from_rgb(255, 255, 255),
+            muted_text: Color32::from_rgb(78, 80, 88),
+            border: Color32::from_rgb(205, 208, 212),
+            dark_mode: false,
+        },
+        DiscordTheme::AMOLED => Palette {
+            accent: Color32::from_rgb(88, 101, 242),
+            accent_hovered: Color32::from_rgb(71, 82, 196),
+            accent_active: Color32::from_rgb(58, 67, 159),
+            panel: Color32::from_rgb(0, 0, 0),
+            extreme: Color32::from_rgb(10, 10, 11),
+            code: Color32::from_rgb(16, 16, 18),
+            text: Color32::from_rgb(255, 255, 255),
+            muted_text: Color32::from_rgb(160, 162, 166),
+            border: Color32::from_rgb(26, 27, 30),
+            dark_mode: true,
+        },
+    }
+}
 
-    // Background colors
-    style.visuals.panel_fill = Color32::from_rgb(54, 57, 63);
-    style.visuals.extreme_bg_color = Color32::from_rgb(47, 49, 54);
-    style.visuals.code_bg_color = Color32::from_rgb(40, 42, 46);
+fn discord_style(theme: DiscordTheme) -> egui::Style {
+    let colors = palette(theme);
+    let mut style = egui::Style {
+        visuals: if colors.dark_mode {
+            egui::Visuals::dark()
+        } else {
+            egui::Visuals::light()
+        },
+        ..Default::default()
+    };
 
-    // Text colors
-    style.visuals.widgets.inactive.fg_stroke.color = Color32::from_rgb(255, 255, 255);
-    // Fixed: Added .widgets. to the path
-    style.visuals.widgets.noninteractive.fg_stroke.color = Color32::from_rgb(185, 187, 190);
+    // Interactive widgets carry the accent
+    style.visuals.widgets.inactive.bg_fill = colors.accent;
+    style.visuals.widgets.inactive.weak_bg_fill = colors.accent;
+    style.visuals.widgets.hovered.bg_fill = colors.accent_hovered;
+    style.visuals.widgets.hovered.weak_bg_fill = colors.accent_hovered;
+    style.visuals.widgets.active.bg_fill = colors.accent_active;
+    style.visuals.widgets.active.weak_bg_fill = colors.accent_active;
+    style.visuals.selection.bg_fill = colors.accent;
 
-    // Window styling
-    style.visuals.window_fill = Color32::from_rgb(54, 57, 63);
-    style.visuals.window_stroke = Stroke::new(1.0, Color32::from_rgb(32, 34, 37));
+    // Backgrounds
+    style.visuals.panel_fill = colors.panel;
+    style.visuals.extreme_bg_color = colors.extreme;
+    style.visuals.code_bg_color = colors.code;
+    style.visuals.window_fill = colors.panel;
+    style.visuals.window_stroke = Stroke::new(1.0, colors.border);
+
+    // Text
+    style.visuals.widgets.inactive.fg_stroke.color = colors.text;
+    style.visuals.widgets.hovered.fg_stroke.color = colors.text;
+    style.visuals.widgets.active.fg_stroke.color = colors.text;
+    style.visuals.widgets.noninteractive.fg_stroke.color = colors.muted_text;
 
     // Spacing
     style.spacing.item_spacing = egui::Vec2::new(8.0, 8.0);
-    style.spacing.window_margin = egui::Margin::same(8); // Changed: 8.0 -> 8
+    style.spacing.window_margin = egui::Margin::same(8);
 
     style
+}
+
+/// Convert a captured frame into something egui can upload.
+///
+/// Frames arrive as 32-bit BGR/RGB; the preview is only ever a few hundred pixels
+/// wide, so pixels are subsampled by an integer step instead of copying (and
+/// swizzling) eight megabytes per frame at 60 fps.
+fn frame_to_color_image(frame: &Frame, max_width: u32) -> ColorImage {
+    let step = frame.width.div_ceil(max_width.max(1)).max(1) as usize;
+    let width = frame.width as usize;
+    let height = frame.height as usize;
+    let out_width = width.div_ceil(step);
+    let out_height = height.div_ceil(step);
+
+    let mut rgb = Vec::with_capacity(out_width * out_height * 3);
+    for y in (0..height).step_by(step) {
+        let row = y * width * 4;
+        for x in (0..width).step_by(step) {
+            let i = row + x * 4;
+            let Some(px) = frame.data.get(i..i + 4) else {
+                continue;
+            };
+            match frame.pixel_format {
+                PixelFormat::Bgrx | PixelFormat::Bgra => rgb.extend_from_slice(&[px[2], px[1], px[0]]),
+                PixelFormat::Rgbx | PixelFormat::Rgba => rgb.extend_from_slice(&[px[0], px[1], px[2]]),
+            }
+        }
+    }
+
+    // Guard against a short final row if the buffer was truncated mid-frame.
+    let usable_rows = rgb.len() / (out_width * 3).max(1);
+    rgb.truncate(out_width * usable_rows * 3);
+    ColorImage::from_rgb([out_width, usable_rows], &rgb)
 }
 
 fn update_texture(
