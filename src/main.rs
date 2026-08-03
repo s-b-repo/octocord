@@ -1,16 +1,8 @@
 use anyhow::Result;
-use log::{error, info};
+use log::info;
 use std::sync::{Arc, Mutex};
 
-mod audio;
-mod video;
-mod screen;
-mod webcam;
-mod gui;
-mod config;
-mod runtime;
-
-use gui::DiscordRecorderApp;
+use discord_recorder::{AppState, DiscordRecorderApp};
 use eframe::egui;
 
 fn main() -> Result<()> {
@@ -19,7 +11,7 @@ fn main() -> Result<()> {
     info!("Starting Discord Recorder");
 
     // Create application state
-    let app_state = Arc::new(Mutex::new(gui::AppState::new()));
+    let app_state = Arc::new(Mutex::new(AppState::new()));
 
     // Configure eframe
     let native_options = eframe::NativeOptions {
@@ -31,13 +23,10 @@ fn main() -> Result<()> {
     };
 
     // Run the application
-    if let Err(err) = eframe::run_native(
+    eframe::run_native(
         "Discord Recorder",
         native_options,
         Box::new(|cc| Ok(Box::new(DiscordRecorderApp::new(cc, app_state)))),
-    ) {
-        error!("Failed to launch application: {}", err);
-    }
-
-    Ok(())
+    )
+    .map_err(|err| anyhow::anyhow!("Failed to launch application: {err}"))
 }

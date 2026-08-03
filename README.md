@@ -1,270 +1,191 @@
-# Discord Recorder
+# Discord Recorder (Octocord)
 
-A high-performance screen recording application with Discord-inspired UI, built in Rust for Windows and Linux systems.
+A screen recorder with a Discord-inspired UI, written in Rust. Captures the desktop,
+system audio, the microphone and a webcam overlay, and encodes with ffmpeg — on the GPU
+when one is available.
 
 ## Features
 
-- 🎥 **Cross-Platform** - Works on Windows, Arch Linux, and Debian/Ubuntu
-- 🎤 **Audio Recording** - System and microphone audio capture with multiple quality options
-- 📹 **Webcam Support** - Movable and resizable webcam overlay with real-time preview
-- 🎨 **Discord UI** - Beautiful Discord-inspired interface with dark theme
-- ⚡ **High Performance** - Optimized for speed and stability using Rust
-- 🛠️ **Hardware Acceleration** - Utilizes GPU acceleration when available
+- 🖥️ **Wayland and X11** — Wayland desktops are captured through the
+  `xdg-desktop-portal` ScreenCast API and PipeWire; X11 sessions use `x11grab`
+- 🎞️ **Any resolution** — records at the monitor's native size (any size, including
+  HiDPI and odd dimensions), or downscales to 720p/1080p/1440p/2160p or a custom
+  `W×H`, always preserving aspect ratio and never upscaling
+- 🎚️ **Four video and four audio quality tiers**, independent of the resolution
+- 🔊 **System audio, microphone, or both mixed** — "system audio" is the monitor of
+  your default output, which is where desktop sound actually lives
+- 📹 **Webcam overlay** composited into the recording by ffmpeg
+- ⚡ **Hardware encoding** via VAAPI (`h264_vaapi`) with an automatic `libx264` fallback
+- 🎨 **Discord theming** in Dark, Light and AMOLED
 
-## System Requirements
+## Requirements
 
-### Windows
-- Windows 10 or later (64-bit)
-- [Rust](https://www.rust-lang.org/tools/install) 1.88.0 or later
-- [FFmpeg](https://ffmpeg.org/download.html) (add to PATH)
-- [Visual C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) (for building)
+- Rust 1.88 or newer
+- **ffmpeg** — the recorder shells out to it; nothing works without it
+- A Wayland compositor with a working screencast portal (KDE, GNOME, wlroots), or X11
+
+### Debian / Ubuntu / Kali
+
+```bash
+sudo apt install -y \
+    pkgconf ffmpeg libasound2-dev libpipewire-0.3-dev libclang-dev \
+    libxcb1-dev libxcb-randr0-dev libxcb-render0-dev libxcb-shm0-dev \
+    libxcb-xfixes0-dev libwayland-dev
+
+# for the Wayland capture path, install the portal backend for your desktop
+sudo apt install -y xdg-desktop-portal-kde     # KDE Plasma
+# sudo apt install -y xdg-desktop-portal-gnome # GNOME
+# sudo apt install -y xdg-desktop-portal-wlr   # sway / wlroots
+```
+
+`libclang-dev` and `nasm` are only needed for the optional `webcam` feature (it builds
+nokhwa, which compiles mozjpeg). Build with `--no-default-features` to skip both.
 
 ### Arch Linux
-```bash
-# Install Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# Install system dependencies
-sudo pacman -S --needed base-devel \
-    xorg-server xorg-xwininfo \
-    libx11 libxcb pango cairo gdk-pixbuf2 gtk3 \
-    v4l-utils ffmpeg alsa-lib pulseaudio \
-    libv4l libx264 libx265 libvpx libva libvdpau libpulse
+```bash
+sudo pacman -S --needed base-devel clang pkgconf ffmpeg alsa-lib libpipewire \
+    libxcb wayland v4l-utils
+sudo pacman -S --needed xdg-desktop-portal-kde   # or -gnome / -wlr
 ```
 
-### Debian/Ubuntu
-```bash
-# Install Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+## Build and run
 
-# Install system dependencies
-sudo apt update
-sudo apt install -y \
-    build-essential \
-    libx11-dev libxcb-shm0-dev libxcb-xfixes0-dev \
-    libxcb1-dev libxcb-keysyms1-dev libpango1.0-dev \
-    libx11-xcb-dev libxcb-randr0-dev libxcb-xinerama0-dev \
-    libxcb-xtest0-dev libxcb-shape0-dev libxcb-xkb-dev \
-    libxcb-image0-dev libxcb-icccm4-dev libxcb-render-util0-dev \
-    libxkbcommon-dev libxkbcommon-x11-dev libv4l-dev \
-    libavcodec-dev libavformat-dev libswscale-dev \
-    libxcb-util0-dev libxcb-render0-dev libasound2-dev \
-    libpulse-dev ffmpeg
-```
-
-## Installation
-
-1. **Clone the repository:**
 ```bash
 git clone https://github.com/s-b-repo/octocord.git
-cd discord-recorder
-```
-
-2. **Build the project:**
-```bash
-# For your current platform
+cd octocord
 cargo build --release
-
-# Or build for a specific target
-# Windows:
-# cargo build --release --target x86_64-pc-windows-msvc
-# Linux (x86_64):
-# cargo build --release --target x86_64-unknown-linux-gnu
-# Linux (ARM64):
-# cargo build --release --target aarch64-unknown-linux-gnu
-```
-
-3. **Run the application:**
-```bash
-# Windows
-.\target\release\discord-recorder.exe
-
-# Linux
 ./target/release/discord-recorder
 ```
 
-## Usage
+Without a webcam preview (skips the nokhwa/mozjpeg build):
 
-1. **Launch the application** - The Discord-themed interface will appear
-2. **Configure settings** - Select screen, audio device, and webcam options
-3. **Choose quality** - Set video and audio quality preferences
-4. **Start recording** - Click the record button or use hotkeys
-5. **Stop recording** - Click stop or use hotkeys to save your recording
+```bash
+cargo build --release --no-default-features
+```
 
-### Recording Controls
+## How capture works
 
-- **Start/Stop Recording**: Main record button in the top panel or Ctrl+R
-- **Pause/Resume**: Pause button or Ctrl+P
-- **Webcam Toggle**: Camera button or Ctrl+W
-- **Settings**: Gear icon in the top-right corner
-- **Webcam Position**: Drag and resize webcam overlay during recording
+| Session | Video source | Preview |
+|---|---|---|
+| Wayland + portal | ScreenCast portal → PipeWire → ffmpeg stdin | live, from the same stream |
+| Wayland, no portal | `x11grab` (only sees X11 windows) | none |
+| X11 | `x11grab` | live, via XGetImage |
 
-### Output Settings
+On Wayland the compositor asks which screen to share the first time you record. The
+portal's *restore token* is saved in `config.json`, so later recordings start without a
+dialog. **Settings → Forget screen permission** clears it.
 
-- **Video Quality**: 
-  - Low (720p, 30fps)
-  - Medium (1080p, 30fps)
-  - High (1440p, 60fps)
-  - Ultra (4K, 60fps)
-- **Audio Quality**: 
-  - Low (22kHz, 64kbps)
-  - Medium (44kHz, 128kbps)
-  - High (48kHz, 192kbps)
-  - Lossless (96kHz, 320kbps)
-- **Format**: MP4 (H.264 video + AAC audio)
-- **Default Location**:
-  - Windows: `%USERPROFILE%\Videos\Discord Recordings`
-  - Linux: `~/Videos/discord-recordings/`
+A Wayland compositor never exposes the desktop to X11, so `x11grab` on a Wayland session
+records a black frame with only X11 windows visible. That is why the portal path exists
+and why it is preferred automatically.
+
+## Output
+
+- **Container**: Matroska (`.mkv`) with H.264 video and AAC audio
+- **Audio only**: FLAC (`.flac`)
+- **Split output**: `<name>.video.mkv` plus `<name>.audio.flac`
+- **Location**: `~/Videos/discord-recordings` by default
+
+### Video quality
+
+| Tier | Bitrate cap | CRF | Frame rate | x264 preset |
+|---|---|---|---|---|
+| Low | 1 Mbps | 28 | 30 | veryfast |
+| Medium | 2.5 Mbps | 23 | 30 | veryfast |
+| High | 5 Mbps | 20 | 60 | fast |
+| Ultra | 10 Mbps | 18 | 60 | medium |
+
+### Audio quality
+
+| Tier | Sample rate | Bitrate |
+|---|---|---|
+| Low | 22.05 kHz | 64 kbps |
+| Medium | 44.1 kHz | 128 kbps |
+| High | 48 kHz | 256 kbps |
+| Lossless | 96 kHz | 320 kbps |
+
+### Resolution
+
+`Native` keeps the captured size. Presets and custom sizes scale down only — a 1080p
+monitor recorded at "2160p" stays 1080p — and every result is rounded to even
+dimensions, which `yuv420p` and every hardware encoder require.
+
+## Hotkeys
+
+| Action | Default |
+|---|---|
+| Start/stop recording | Ctrl+R |
+| Pause/resume | Ctrl+P |
+| Toggle webcam | Ctrl+W |
+
+All three are rebindable in Settings.
 
 ## Configuration
 
-The application stores configuration in:
-- **Windows**: `%APPDATA%\discord-recorder\config.json`
-- **Linux**: `~/.config/discord-recorder/config.json`
-
-### Configuration Options
+`~/.config/discord-recorder/config.json`, written whenever a recording starts or you
+press **Save settings**. Files written by older versions keep loading; missing fields
+take their defaults.
 
 ```json
 {
-  "recording": {
-    "video_quality": "high",
-    "audio_quality": "medium",
-    "output_dir": "~/Videos/discord-recordings",
-    "fps": 60,
-    "audio_device": "default",
-    "webcam_device": "/dev/video0"
-  },
-  "hotkeys": {
-    "start_stop": "Ctrl+R",
-    "pause_resume": "Ctrl+P",
-    "toggle_webcam": "Ctrl+W"
-  },
-  "ui": {
-    "theme": "dark",
-    "window_size": [1200, 800],
-    "show_fps": true
-  }
+  "output_directory": "/home/you/Videos/discord-recordings",
+  "video_quality": "High",
+  "audio_quality": "High",
+  "output_resolution": "Native",
+  "encoder": "Auto",
+  "audio_source": "System",
+  "capture_cursor": true,
+  "discord_theme": "Dark",
+  "screencast_restore_token": "..."
 }
-```
-
-## Building from Source
-
-### Prerequisites
-
-1. Install Rust 1.88.0 or later
-2. Install platform-specific dependencies (see above)
-3. Clone the repository
-
-### Build Commands
-
-```bash
-# Debug build
-cargo build
-
-# Release build
-cargo build --release
-
-# Cross-compile for Windows from Linux
-rustup target add x86_64-pc-windows-msvc
-cargo build --release --target x86_64-pc-windows-msvc
-
-# Cross-compile for Linux ARM64 from x86_64
-rustup target add aarch64-unknown-linux-gnu
-cargo build --release --target aarch64-unknown-linux-gnu
 ```
 
 ## Troubleshooting
 
-### Common Issues
+**"Failed to launch ffmpeg binary"** — install ffmpeg and make sure it is on `PATH`.
 
-1. **No screens detected**
-   - On Linux: Ensure X11 or Wayland is running and DISPLAY is set
-   - On Windows: Check display drivers and permissions
+**Recording is black on Wayland** — no screencast portal is running, so the recorder
+fell back to `x11grab`. Install the portal backend for your desktop and check
+`systemctl --user status xdg-desktop-portal`.
 
-2. **Audio not recording**
-   - Check system audio input settings
-   - Verify the correct audio device is selected in settings
-   - On Linux, ensure PulseAudio is running
+**The screen picker appears on every recording** — the compositor did not return a
+restore token (some portal backends do not support persistence).
 
-3. **Webcam not working**
-   - Check if the webcam is detected by the system
-   - Verify correct permissions (on Linux, ensure user is in the `video` group)
-   - Try a different webcam device path if applicable
+**No system audio** — the recorder reads the monitor of the default sink through
+PulseAudio/PipeWire. With a bare ALSA setup only microphone capture is possible.
 
-4. **FFmpeg errors**
-   - Ensure FFmpeg is installed and in PATH
-   - Check for codec support in your FFmpeg build
-   - Try reinstalling FFmpeg with additional codec support
+**Hardware encoding unavailable** — the recorder runs a real one-frame VAAPI encode at
+startup to decide. If it fails it silently uses `libx264`; force either one in Settings.
 
-## Contributing
-
-Contributions are welcome! Please follow these steps:
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add some amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-   - Ensure X11 or Wayland is running
-   - Check DISPLAY or WAYLAND_DISPLAY environment variables
-
-2. **Audio not recording**
-   - Verify audio device permissions
-   - Check if PulseAudio/PipeWire is running
-
-3. **Webcam not working**
-   - Ensure camera permissions are granted
-   - Check if camera is being used by another application
-
-4. **Build errors**
-   - Install all required system dependencies
-   - Update Rust toolchain: `rustup update`
-
-### Debug Mode
-
-Run with debug logging:
-```bash
-RUST_LOG=debug ./target/release/discord-recorder
-```
+**Webcam is busy** — the preview releases `/dev/video*` when recording starts, since
+ffmpeg needs exclusive access. Another running app (a browser tab, a meeting client)
+will still hold it.
 
 ## Development
 
-### Project Structure
-
 ```
 src/
-├── main.rs          # Application entry point
-├── gui.rs           # Discord-themed user interface
-├── screen.rs        # Screen capture implementation
-├── audio.rs         # Audio recording
-├── video.rs         # Video encoding
-├── webcam.rs        # Webcam capture
-└── config.rs        # Configuration management
+├── main.rs             # entry point
+├── gui.rs              # Discord-themed egui interface
+├── portal.rs           # xdg-desktop-portal ScreenCast handshake
+├── pipewire_capture.rs # PipeWire stream → frames
+├── video.rs            # ffmpeg command construction and process control
+├── screen.rs           # X11 preview capture and display enumeration
+├── audio.rs            # audio device enumeration and level metering
+├── webcam.rs           # webcam preview
+└── config.rs           # persisted settings
 ```
 
-### Adding Features
+Two examples double as end-to-end checks:
 
-1. Fork the repository
-2. Create a feature branch
-3. Implement your changes
-4. Add tests if applicable
-5. Submit a pull request
+```bash
+cargo run --example screencast_probe          # portal + PipeWire, writes a PNG
+cargo run --example record_probe -- 5 720 high system auto   # a real recording
+```
+
+`cargo test` covers the configuration and quality mappings.
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## Acknowledgments
-
-- Inspired by OBS Studio and Discord's design language
-- Built with the Rust ecosystem and open-source libraries
-- Thanks to the contributors of egui, FFmpeg, and other dependencies
-
-## Support
-
-For issues and feature requests, please open a GitHub issue.
-For questions and discussions, use the GitHub Discussions tab.
+MIT — see [LICENSE](LICENSE).
